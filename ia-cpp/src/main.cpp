@@ -67,11 +67,14 @@ static std::optional<OrtContext> tryLoadOrt(const std::string& modelPath) {
 
   size_t num_input_nodes = 0;
   size_t num_output_nodes = 0;
-  ctx.api->SessionGetInputCount(ctx.session, &num_input_nodes);
-  ctx.api->SessionGetOutputCount(ctx.session, &num_output_nodes);
+  status = ctx.api->SessionGetInputCount(ctx.session, &num_input_nodes);
+  if (status) { ctx.api->ReleaseStatus(status); }
+  status = ctx.api->SessionGetOutputCount(ctx.session, &num_output_nodes);
+  if (status) { ctx.api->ReleaseStatus(status); }
 
   OrtAllocator* allocator = nullptr;
-  ctx.api->GetAllocatorWithDefaultOptions(&allocator);
+  status = ctx.api->GetAllocatorWithDefaultOptions(&allocator);
+  if (status) { ctx.api->ReleaseStatus(status); }
   // Try to fetch names (best-effort across ORT versions)
   for (size_t i = 0; i < num_input_nodes; ++i) {
     char* name = nullptr;
@@ -109,15 +112,18 @@ static InferenceResult runOrt(OrtContext& ctx, float x_val) {
   res.used_model = true;
 
   OrtMemoryInfo* memory_info = nullptr;
-  ctx.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
+  OrtStatus* status = nullptr;
+  status = ctx.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
+  if (status) { ctx.api->ReleaseStatus(status); }
 
   std::vector<int64_t> input_shape = {1};
   float input_value = x_val;
 
   OrtValue* input_tensor = nullptr;
-  ctx.api->CreateTensorWithDataAsOrtValue(
+  status = ctx.api->CreateTensorWithDataAsOrtValue(
       memory_info, &input_value, sizeof(float), input_shape.data(), input_shape.size(),
       ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
+  if (status) { ctx.api->ReleaseStatus(status); }
 
   const char* input_name = "input";  // generic default
   const char* output_name = "output"; // generic default
@@ -125,7 +131,7 @@ static InferenceResult runOrt(OrtContext& ctx, float x_val) {
   const char* output_names[] = {output_name};
 
   OrtValue* output_tensor = nullptr;
-  OrtStatus* status = ctx.api->Run(
+  status = ctx.api->Run(
       ctx.session, nullptr,
       input_names, (const OrtValue* const*)&input_tensor, 1,
       output_names, 1, &output_tensor);
@@ -141,7 +147,8 @@ static InferenceResult runOrt(OrtContext& ctx, float x_val) {
   }
 
   float* out_data = nullptr;
-  ctx.api->GetTensorMutableData(output_tensor, (void**)&out_data);
+  status = ctx.api->GetTensorMutableData(output_tensor, (void**)&out_data);
+  if (status) { ctx.api->ReleaseStatus(status); }
   float y = out_data ? out_data[0] : (3.0f * x_val + 0.5f);
 
   res.body = json{{"y", y}};
@@ -227,7 +234,7 @@ int main() {
     res.add_header("Access-Control-Allow-Methods", "POST, OPTIONS");
   };
 
-  CROW_ROUTE(app, "/health").methods(crow::HTTPMethod::GET)([]() {
+  CROW_ROUTE(app, "/health").methods(crow::HTTPMethod::GET)([](const crow::request&) {
     return crow::response(200, "ok");
   });
 
