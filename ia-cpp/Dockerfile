@@ -50,5 +50,3 @@ ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
 EXPOSE 10000
 
 CMD ["/app/build/app"]
-
-

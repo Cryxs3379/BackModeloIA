@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ia-cpp
+    env: docker
+    plan: free
+    rootDir: ia-cpp
+    healthCheckPath: /health
+    autoDeploy: true
+    # Optionally define env vars here or set them in the dashboard
+    # envVars:
+    #   - key: ALLOW_ORIGIN
+    #     value: "https://tu-frontend.com"
+    #   - key: FAIL_ON_MISSING_MODEL
+    #     value: "false"
+
+
