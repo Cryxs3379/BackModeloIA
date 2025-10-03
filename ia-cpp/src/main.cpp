@@ -247,6 +247,8 @@ int main() {
   CROW_ROUTE(app, "/predict").methods(crow::HTTPMethod::POST)([&](const crow::request& req) {
     crow::response res;
     try {
+      std::cerr << "[debug] POST /predict - body length: " << req.body.length() << std::endl;
+      std::cerr << "[debug] POST /predict - body content: '" << req.body << "'" << std::endl;
       auto body = json::parse(req.body);
       if (!body.contains("x") || !body["x"].is_number()) {
         res.code = 400;
