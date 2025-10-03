@@ -188,6 +188,11 @@ int main() {
     // POST /predict endpoint
     svr.Post("/predict", [&cors_origin](const httplib::Request& req, httplib::Response& res) {
         try {
+            // Debug logging
+            std::cerr << "[debug] POST /predict - body length: " << req.body.length() << std::endl;
+            std::cerr << "[debug] POST /predict - body content: '" << req.body << "'" << std::endl;
+            std::cerr << "[debug] POST /predict - Content-Type: " << req.get_header_value("Content-Type") << std::endl;
+            
             // Parse JSON
             json body = json::parse(req.body);
             
