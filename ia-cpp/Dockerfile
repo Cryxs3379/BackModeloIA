@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.5
 
-ARG ORT_VER=1.17.3
+ARG ORT_VER=1.18.0
 
 FROM debian:bookworm-slim AS build
 

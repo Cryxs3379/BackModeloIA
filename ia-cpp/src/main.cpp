@@ -7,6 +7,8 @@
 // ONNX Runtime (optional)
 #ifdef WITH_ORT
 #include <onnxruntime_cxx_api.h>
+#include <optional>
+#include <array>
 #endif
 
 // HTTP server
@@ -14,12 +16,119 @@
 
 using json = nlohmann::json;
 
+// Inference result structure
+struct InferenceResult {
+    json body;
+    bool used_model = false;
+};
+
 // Global variables
-std::unique_ptr<Ort::Env> ort_env;
-std::unique_ptr<Ort::Session> ort_session;
-std::string input_name = "input";
-std::string output_name = "output";
 bool model_loaded = false;
+#ifdef WITH_ORT
+std::optional<OrtContext> ort_ctx;
+#endif
+
+#ifdef WITH_ORT
+struct OrtContext {
+  std::unique_ptr<Ort::Env> env;
+  std::unique_ptr<Ort::Session> session;
+  std::string input_name{"input"};
+  std::string output_name{"output"};
+  std::string ort_version;
+  size_t num_inputs{0};
+  size_t num_outputs{0};
+};
+
+static void releaseOrtContext(OrtContext& ctx) {
+  // (unique_ptr se encarga solo)
+}
+
+static std::optional<OrtContext> tryLoadOrt(const std::string& modelPath) {
+  OrtContext ctx;
+  ctx.env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "ia-cpp");
+  ctx.ort_version = OrtGetApiBase()->GetVersionString();
+
+  Ort::SessionOptions opts;
+  // Config opcional, p.ej. threads:
+  // opts.SetIntraOpNumThreads(1);
+
+  try {
+    ctx.session = std::make_unique<Ort::Session>(*ctx.env, modelPath.c_str(), opts);
+  } catch (const Ort::Exception& e) {
+    std::cerr << "[warn] ORT failed to create session: " << e.what() << std::endl;
+    return std::nullopt;
+  }
+
+  ctx.num_inputs  = ctx.session->GetInputCount();
+  ctx.num_outputs = ctx.session->GetOutputCount();
+
+  Ort::AllocatorWithDefaultOptions allocator;
+
+  // Nombres de entrada/salida (si existen; si no, se mantienen "input"/"output")
+  if (ctx.num_inputs > 0) {
+    try {
+      auto name = ctx.session->GetInputNameAllocated(0, allocator);
+      if (name) ctx.input_name = name.get();
+    } catch (...) {}
+  }
+  if (ctx.num_outputs > 0) {
+    try {
+      auto name = ctx.session->GetOutputNameAllocated(0, allocator);
+      if (name) ctx.output_name = name.get();
+    } catch (...) {}
+  }
+
+  // Log informativo
+  std::cerr << "[info] ONNX Runtime session created. Inputs(" << ctx.num_inputs
+            << ") name0=" << ctx.input_name
+            << " | Outputs(" << ctx.num_outputs
+            << ") name0=" << ctx.output_name << std::endl;
+
+  return ctx;
+}
+
+static InferenceResult runOrt(OrtContext& ctx, float x_val) {
+  InferenceResult res;
+  res.used_model = true;
+
+  try {
+    // Entrada: tensor float [1]
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    std::array<int64_t, 1> shape{1};
+    auto input_tensor = Ort::Value::CreateTensor<float>(mem, &x_val, /*value_count*/ 1,
+                                                        shape.data(), shape.size());
+
+    const char* in_names[]  = { ctx.input_name.c_str()  };
+    const char* out_names[] = { ctx.output_name.c_str() };
+
+    // Ejecutar
+    auto outputs = ctx.session->Run(Ort::RunOptions{nullptr},
+                                    in_names,  &input_tensor, 1,
+                                    out_names, 1);
+
+    if (outputs.empty() || !outputs[0].IsTensor()) {
+      throw std::runtime_error("ORT returned no tensor output");
+    }
+
+    float* out_data = outputs[0].GetTensorMutableData<float>();
+    float y = out_data ? out_data[0] : (3.0f * x_val + 0.5f);
+
+    res.body = json{{"y", y}};
+    return res;
+
+  } catch (const Ort::Exception& e) {
+    std::cerr << "[warn] ORT run failed: " << e.what() << " (fallback to dummy)" << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "[warn] ORT run failed: " << e.what() << " (fallback to dummy)" << std::endl;
+  }
+
+  // Fallback dummy
+  float y = 3.0f * x_val + 0.5f;
+  res.used_model = false;
+  res.body = json{{"y", y}, {"note", "dummy: ORT run failed"}};
+  return res;
+}
+#endif
 
 // CORS helper function
 void add_cors_headers(httplib::Response& res, const std::string& allow_origin) {
@@ -48,93 +157,6 @@ std::string get_cors_origin() {
     return "*";
 }
 
-#ifdef WITH_ORT
-// Load ONNX model
-bool load_onnx_model() {
-    try {
-        // Initialize ONNX Runtime
-        ort_env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "ia-cpp");
-        
-        // Create session options
-        Ort::SessionOptions session_options;
-        session_options.SetIntraOpNumThreads(1);
-        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-        
-        // Create session
-        ort_session = std::make_unique<Ort::Session>(*ort_env, "models/model.onnx", session_options);
-        
-        // Get input/output info
-        Ort::AllocatorWithDefaultOptions allocator;
-        
-        // Input info
-        size_t num_input_nodes = ort_session->GetInputCount();
-        if (num_input_nodes > 0) {
-            char* input_name_cstr = ort_session->GetInputName(0, allocator);
-            if (input_name_cstr) {
-                input_name = std::string(input_name_cstr);
-                allocator.Free(input_name_cstr);
-            }
-        }
-        
-        // Output info
-        size_t num_output_nodes = ort_session->GetOutputCount();
-        if (num_output_nodes > 0) {
-            char* output_name_cstr = ort_session->GetOutputName(0, allocator);
-            if (output_name_cstr) {
-                output_name = std::string(output_name_cstr);
-                allocator.Free(output_name_cstr);
-            }
-        }
-        
-        std::cout << "[info] ONNX Runtime version: " << OrtGetApiBase()->GetVersionString() << std::endl;
-        std::cout << "[info] Model loaded successfully" << std::endl;
-        std::cout << "[info] Input name: " << input_name << std::endl;
-        std::cout << "[info] Output name: " << output_name << std::endl;
-        
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "[warn] Failed to load ONNX model: " << e.what() << std::endl;
-        return false;
-    }
-}
-
-// Run ONNX inference
-json run_onnx_inference(float x) {
-    try {
-        // Prepare input
-        std::vector<int64_t> input_shape = {1};
-        std::vector<float> input_data = {x};
-        
-        // Create input tensor
-        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        auto input_tensor = Ort::Value::CreateTensor<float>(
-            memory_info, input_data.data(), input_data.size(), 
-            input_shape.data(), input_shape.size()
-        );
-        
-        // Run inference
-        const char* input_names[] = {input_name.c_str()};
-        const char* output_names[] = {output_name.c_str()};
-        
-        auto output_tensors = ort_session->Run(
-            Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, 
-            output_names, 1
-        );
-        
-        // Get output
-        float* output_data = output_tensors[0].GetTensorMutableData<float>();
-        float result = output_data[0];
-        
-        json response;
-        response["y"] = result;
-        return response;
-        
-    } catch (const std::exception& e) {
-        std::cerr << "[warn] ONNX inference failed: " << e.what() << std::endl;
-        throw;
-    }
-}
-#endif
 
 // Dummy inference
 json run_dummy_inference(float x) {
@@ -158,7 +180,8 @@ int main() {
     
     // Try to load ONNX model
 #ifdef WITH_ORT
-    model_loaded = load_onnx_model();
+    ort_ctx = tryLoadOrt("models/model.onnx");
+    model_loaded = ort_ctx.has_value();
     if (!model_loaded && should_fail) {
         std::cerr << "[error] FAIL_ON_MISSING_MODEL is true but model failed to load" << std::endl;
         return 1;
@@ -211,14 +234,9 @@ int main() {
             
             // Try ONNX inference if model is loaded
 #ifdef WITH_ORT
-            if (model_loaded) {
-                try {
-                    response = run_onnx_inference(x);
-                } catch (...) {
-                    // Fallback to dummy if ONNX fails
-                    response = run_dummy_inference(x);
-                    response["note"] = "dummy: ORT run failed";
-                }
+            if (model_loaded && ort_ctx.has_value()) {
+                InferenceResult result = runOrt(ort_ctx.value(), x);
+                response = result.body;
             } else {
                 response = run_dummy_inference(x);
             }
