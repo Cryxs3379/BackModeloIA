@@ -1,295 +1,252 @@
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
 #include <iostream>
-#include <optional>
 #include <string>
-#include <vector>
+#include <memory>
+#include <cstdlib>
+#include <nlohmann/json.hpp>
 
-#include "crow_all.h"      // header-only HTTP server
-#include "json.hpp"         // nlohmann::json header-only
+// ONNX Runtime (optional)
+#ifdef WITH_ORT
+#include <onnxruntime_cxx_api.h>
+#endif
+
+// HTTP server
+#include "httplib.h"
 
 using json = nlohmann::json;
 
-#ifdef WITH_ORT
-#include <onnxruntime_c_api.h>
-#endif
+// Global variables
+std::unique_ptr<Ort::Env> ort_env;
+std::unique_ptr<Ort::Session> ort_session;
+std::string input_name = "input";
+std::string output_name = "output";
+bool model_loaded = false;
 
-struct InferenceResult {
-  json body;
-  bool used_model = false;
-};
-
-static std::string getEnvOrDefault(const char* key, const std::string& def) {
-  const char* val = std::getenv(key);
-  return val ? std::string(val) : def;
-}
-
-static bool fileExists(const std::string& path) {
-  try {
-    return std::filesystem::exists(path);
-  } catch (...) {
-    return false;
-  }
-}
-
-#ifdef WITH_ORT
-struct OrtContext {
-  const OrtApi* api = nullptr;
-  OrtEnv* env = nullptr;
-  OrtSessionOptions* session_options = nullptr;
-  OrtSession* session = nullptr;
-  std::vector<const char*> input_names;
-  std::vector<const char*> output_names;
-  std::string ort_version;
-};
-
-static void releaseOrtContext(OrtContext& ctx) {
-  if (ctx.session) ctx.api->ReleaseSession(ctx.session);
-  if (ctx.session_options) ctx.api->ReleaseSessionOptions(ctx.session_options);
-  if (ctx.env) ctx.api->ReleaseEnv(ctx.env);
-}
-
-static std::optional<OrtContext> tryLoadOrt(const std::string& modelPath) {
-  OrtContext ctx;
-  auto* api_base = OrtGetApiBase();
-  ctx.api = api_base->GetApi(ORT_API_VERSION);
-  ctx.ort_version = api_base->GetVersionString();
-
-  OrtStatus* status = nullptr;
-  status = ctx.api->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "ia-cpp", &ctx.env);
-  if (status) { ctx.api->ReleaseStatus(status); return std::nullopt; }
-  status = ctx.api->CreateSessionOptions(&ctx.session_options);
-  if (status) { ctx.api->ReleaseStatus(status); releaseOrtContext(ctx); return std::nullopt; }
-
-  status = ctx.api->CreateSession(ctx.env, modelPath.c_str(), ctx.session_options, &ctx.session);
-  if (status) { ctx.api->ReleaseStatus(status); releaseOrtContext(ctx); return std::nullopt; }
-
-  size_t num_input_nodes = 0;
-  size_t num_output_nodes = 0;
-  status = ctx.api->SessionGetInputCount(ctx.session, &num_input_nodes);
-  if (status) { ctx.api->ReleaseStatus(status); }
-  status = ctx.api->SessionGetOutputCount(ctx.session, &num_output_nodes);
-  if (status) { ctx.api->ReleaseStatus(status); }
-
-  OrtAllocator* allocator = nullptr;
-  status = ctx.api->GetAllocatorWithDefaultOptions(&allocator);
-  if (status) { ctx.api->ReleaseStatus(status); }
-  // Try to fetch names (best-effort across ORT versions)
-  for (size_t i = 0; i < num_input_nodes; ++i) {
-    char* name = nullptr;
-    if (!ctx.api->SessionGetInputName || !allocator) break;
-    if (ctx.api->SessionGetInputName(ctx.session, i, allocator, &name) == nullptr && name) {
-      ctx.input_names.push_back(strdup(name));
-      allocator->Free(allocator, name);
+// CORS helper function
+void add_cors_headers(httplib::Response& res, const std::string& allow_origin) {
+    if (!allow_origin.empty()) {
+        res.set_header("Access-Control-Allow-Origin", allow_origin);
     }
-  }
-  for (size_t i = 0; i < num_output_nodes; ++i) {
-    char* name = nullptr;
-    if (!ctx.api->SessionGetOutputName || !allocator) break;
-    if (ctx.api->SessionGetOutputName(ctx.session, i, allocator, &name) == nullptr && name) {
-      ctx.output_names.push_back(strdup(name));
-      allocator->Free(allocator, name);
-    }
-  }
-
-  std::cerr << "[info] ONNX Runtime session created. Inputs(" << num_input_nodes << "): ";
-  for (size_t i = 0; i < ctx.input_names.size(); ++i) {
-    std::cerr << (i ? ", " : "") << ctx.input_names[i];
-  }
-  std::cerr << " | Outputs(" << num_output_nodes << "): ";
-  for (size_t i = 0; i < ctx.output_names.size(); ++i) {
-    std::cerr << (i ? ", " : "") << ctx.output_names[i];
-  }
-  std::cerr << std::endl;
-  return ctx;
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    res.set_header("Access-Control-Allow-Methods", "POST, OPTIONS");
 }
 
-static InferenceResult runOrt(OrtContext& ctx, float x_val) {
-  // This example assumes a simple single-float input/output model for demonstration.
-  // If shapes/types differ, users should replace the placeholder model accordingly.
-  InferenceResult res;
-  res.used_model = true;
+// Get CORS origin from environment
+std::string get_cors_origin() {
+    const char* allow_origin = std::getenv("ALLOW_ORIGIN");
+    if (allow_origin && strlen(allow_origin) > 0) {
+        return std::string(allow_origin);
+    }
+    
+    // Check if running on Render
+    const char* render_env = std::getenv("RENDER");
+    if (render_env) {
+        // On Render, don't use wildcard by default
+        return "";
+    }
+    
+    // In development, use wildcard
+    return "*";
+}
 
-  OrtMemoryInfo* memory_info = nullptr;
-  OrtStatus* status = nullptr;
-  status = ctx.api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory_info);
-  if (status) { ctx.api->ReleaseStatus(status); }
+#ifdef WITH_ORT
+// Load ONNX model
+bool load_onnx_model() {
+    try {
+        // Initialize ONNX Runtime
+        ort_env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "ia-cpp");
+        
+        // Create session options
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(1);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        
+        // Create session
+        ort_session = std::make_unique<Ort::Session>(*ort_env, "models/model.onnx", session_options);
+        
+        // Get input/output info
+        Ort::AllocatorWithDefaultOptions allocator;
+        
+        // Input info
+        size_t num_input_nodes = ort_session->GetInputCount();
+        if (num_input_nodes > 0) {
+            char* input_name_cstr = ort_session->GetInputName(0, allocator);
+            if (input_name_cstr) {
+                input_name = std::string(input_name_cstr);
+                allocator.Free(input_name_cstr);
+            }
+        }
+        
+        // Output info
+        size_t num_output_nodes = ort_session->GetOutputCount();
+        if (num_output_nodes > 0) {
+            char* output_name_cstr = ort_session->GetOutputName(0, allocator);
+            if (output_name_cstr) {
+                output_name = std::string(output_name_cstr);
+                allocator.Free(output_name_cstr);
+            }
+        }
+        
+        std::cout << "[info] ONNX Runtime version: " << OrtGetApiBase()->GetVersionString() << std::endl;
+        std::cout << "[info] Model loaded successfully" << std::endl;
+        std::cout << "[info] Input name: " << input_name << std::endl;
+        std::cout << "[info] Output name: " << output_name << std::endl;
+        
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[warn] Failed to load ONNX model: " << e.what() << std::endl;
+        return false;
+    }
+}
 
-  std::vector<int64_t> input_shape = {1};
-  float input_value = x_val;
-
-  OrtValue* input_tensor = nullptr;
-  status = ctx.api->CreateTensorWithDataAsOrtValue(
-      memory_info, &input_value, sizeof(float), input_shape.data(), input_shape.size(),
-      ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor);
-  if (status) { ctx.api->ReleaseStatus(status); }
-
-  const char* input_name = "input";  // generic default
-  const char* output_name = "output"; // generic default
-  const char* input_names[] = {input_name};
-  const char* output_names[] = {output_name};
-
-  OrtValue* output_tensor = nullptr;
-  status = ctx.api->Run(
-      ctx.session, nullptr,
-      input_names, (const OrtValue* const*)&input_tensor, 1,
-      output_names, 1, &output_tensor);
-
-  if (status) {
-    // Fallback to dummy if run fails
-    ctx.api->ReleaseStatus(status);
-    if (input_tensor) ctx.api->ReleaseValue(input_tensor);
-    if (memory_info) ctx.api->ReleaseMemoryInfo(memory_info);
-    float y = 3.0f * x_val + 0.5f;
-    res.body = json{{"y", y}, {"note", "dummy: ORT run failed"}};
-    return res;
-  }
-
-  float* out_data = nullptr;
-  status = ctx.api->GetTensorMutableData(output_tensor, (void**)&out_data);
-  if (status) { ctx.api->ReleaseStatus(status); }
-  float y = out_data ? out_data[0] : (3.0f * x_val + 0.5f);
-
-  res.body = json{{"y", y}};
-
-  if (output_tensor) ctx.api->ReleaseValue(output_tensor);
-  if (input_tensor) ctx.api->ReleaseValue(input_tensor);
-  if (memory_info) ctx.api->ReleaseMemoryInfo(memory_info);
-  return res;
+// Run ONNX inference
+json run_onnx_inference(float x) {
+    try {
+        // Prepare input
+        std::vector<int64_t> input_shape = {1};
+        std::vector<float> input_data = {x};
+        
+        // Create input tensor
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        auto input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info, input_data.data(), input_data.size(), 
+            input_shape.data(), input_shape.size()
+        );
+        
+        // Run inference
+        const char* input_names[] = {input_name.c_str()};
+        const char* output_names[] = {output_name.c_str()};
+        
+        auto output_tensors = ort_session->Run(
+            Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, 
+            output_names, 1
+        );
+        
+        // Get output
+        float* output_data = output_tensors[0].GetTensorMutableData<float>();
+        float result = output_data[0];
+        
+        json response;
+        response["y"] = result;
+        return response;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "[warn] ONNX inference failed: " << e.what() << std::endl;
+        throw;
+    }
 }
 #endif
 
-static InferenceResult runDummy(float x_val) {
-  float y = 3.0f * x_val + 0.5f;
-  InferenceResult r;
-  r.used_model = false;
-  r.body = json{{"y", y}, {"note", "dummy"}};
-  return r;
+// Dummy inference
+json run_dummy_inference(float x) {
+    json response;
+    response["y"] = 3.0f * x + 0.5f;
+    response["note"] = "dummy";
+    return response;
 }
 
 int main() {
-  const std::string allow_origin_env = getEnvOrDefault("ALLOW_ORIGIN", "");
-  const std::string port_env = getEnvOrDefault("PORT", "10000");
-  const std::string fail_on_missing_model = getEnvOrDefault("FAIL_ON_MISSING_MODEL", "false");
-
-  const std::string model_path = "models/model.onnx";
-  bool model_exists = fileExists(model_path);
-
-  std::optional<std::string> allow_origin;
-  if (!allow_origin_env.empty()) {
-    allow_origin = allow_origin_env;
-  } else {
-    // If not set, use '*' only in dev (we assume we are in dev unless RENDER env is present)
-    const char* render_env = std::getenv("RENDER");
-    if (render_env) {
-      allow_origin = std::nullopt; // no wildcard by default in production-like
-    } else {
-      allow_origin = std::string("*");
-    }
-  }
-
+    // Get configuration from environment
+    const char* port_str = std::getenv("PORT");
+    int port = port_str ? std::atoi(port_str) : 10000;
+    
+    const char* fail_on_missing_model = std::getenv("FAIL_ON_MISSING_MODEL");
+    bool should_fail = (fail_on_missing_model && 
+                       (std::string(fail_on_missing_model) == "true" || 
+                        std::string(fail_on_missing_model) == "1"));
+    
+    std::string cors_origin = get_cors_origin();
+    
+    // Try to load ONNX model
 #ifdef WITH_ORT
-  std::optional<OrtContext> ort;
-  if (model_exists) {
-    ort = tryLoadOrt(model_path);
-    if (!ort.has_value()) {
-      std::cerr << "[warn] Failed to load ONNX model; will use dummy inference." << std::endl;
+    model_loaded = load_onnx_model();
+    if (!model_loaded && should_fail) {
+        std::cerr << "[error] FAIL_ON_MISSING_MODEL is true but model failed to load" << std::endl;
+        return 1;
     }
-  } else {
-    std::cerr << "[info] No model file found; using dummy inference." << std::endl;
-  }
 #else
-  if (model_exists) {
-    std::cerr << "[info] Model present but binary built without ONNX Runtime; using dummy." << std::endl;
-  } else {
-    std::cerr << "[info] No model file found; using dummy inference." << std::endl;
-  }
+    std::cout << "[info] ONNX Runtime not available, using dummy mode" << std::endl;
 #endif
-
-  if (!model_exists && (fail_on_missing_model == "1" || fail_on_missing_model == "true")) {
-    std::cerr << "[error] FAIL_ON_MISSING_MODEL set; model missing. Exiting." << std::endl;
-    return 1;
-  }
-
-  if (allow_origin.has_value()) {
-    std::cerr << "[info] CORS allowed origin: " << *allow_origin << std::endl;
-  } else {
-    std::cerr << "[info] CORS allowed origin: <none>" << std::endl;
-  }
-
-#ifdef WITH_ORT
-  if (model_exists && ort.has_value()) {
-    std::cerr << "[info] ONNX Runtime version: " << ort->ort_version << std::endl;
-  }
-#endif
-
-  crow::SimpleApp app;
-
-  auto add_cors_headers = [&](crow::response& res) {
-    if (allow_origin.has_value()) {
-      res.add_header("Access-Control-Allow-Origin", *allow_origin);
+    
+    if (!model_loaded) {
+        std::cout << "[info] Running in dummy mode (no ONNX model)" << std::endl;
     }
-    res.add_header("Access-Control-Allow-Headers", "Content-Type");
-    res.add_header("Access-Control-Allow-Methods", "POST, OPTIONS");
-  };
-
-  CROW_ROUTE(app, "/health").methods(crow::HTTPMethod::GET)([](const crow::request&) {
-    return crow::response(200, "ok");
-  });
-
-  CROW_ROUTE(app, "/predict").methods(crow::HTTPMethod::OPTIONS)([&](const crow::request&) {
-    crow::response res(204);
-    add_cors_headers(res);
-    return res;
-  });
-
-  CROW_ROUTE(app, "/predict").methods(crow::HTTPMethod::POST)([&](const crow::request& req) {
-    crow::response res;
-    try {
-      std::cerr << "[debug] POST /predict - body length: " << req.body.length() << std::endl;
-      std::cerr << "[debug] POST /predict - body content: '" << req.body << "'" << std::endl;
-      auto body = json::parse(req.body);
-      if (!body.contains("x") || !body["x"].is_number()) {
-        res.code = 400;
-        res.body = "{\"error\":\"x must be a number\"}";
-        add_cors_headers(res);
-        return res;
-      }
-      float x = body["x"].get<float>();
-
+    
+    // Create HTTP server
+    httplib::Server svr;
+    
+    // Health endpoint
+    svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("ok", "text/plain");
+    });
+    
+    // OPTIONS /predict for CORS
+    svr.Options("/predict", [&cors_origin](const httplib::Request&, httplib::Response& res) {
+        res.status = 204;
+        add_cors_headers(res, cors_origin);
+    });
+    
+    // POST /predict endpoint
+    svr.Post("/predict", [&cors_origin](const httplib::Request& req, httplib::Response& res) {
+        try {
+            // Parse JSON
+            json body = json::parse(req.body);
+            
+            // Validate input
+            if (!body.contains("x") || !body["x"].is_number()) {
+                res.status = 400;
+                json error_response;
+                error_response["error"] = "x must be a number";
+                res.set_content(error_response.dump(), "application/json");
+                add_cors_headers(res, cors_origin);
+                return;
+            }
+            
+            float x = body["x"].get<float>();
+            json response;
+            
+            // Try ONNX inference if model is loaded
 #ifdef WITH_ORT
-      InferenceResult infRes;
-      if (model_exists) {
-        if (auto* p = ort ? &*ort : nullptr) {
-          infRes = runOrt(*p, x);
-        } else {
-          infRes = runDummy(x);
+            if (model_loaded) {
+                try {
+                    response = run_onnx_inference(x);
+                } catch (...) {
+                    // Fallback to dummy if ONNX fails
+                    response = run_dummy_inference(x);
+                    response["note"] = "dummy: ORT run failed";
+                }
+            } else {
+                response = run_dummy_inference(x);
+            }
+#else
+            response = run_dummy_inference(x);
+#endif
+            
+            res.set_content(response.dump(), "application/json");
+            add_cors_headers(res, cors_origin);
+            
+        } catch (const json::parse_error& e) {
+            res.status = 400;
+            json error_response;
+            error_response["error"] = "Invalid JSON: " + std::string(e.what());
+            res.set_content(error_response.dump(), "application/json");
+            add_cors_headers(res, cors_origin);
+        } catch (const std::exception& e) {
+            res.status = 500;
+            json error_response;
+            error_response["error"] = "Internal server error";
+            res.set_content(error_response.dump(), "application/json");
+            add_cors_headers(res, cors_origin);
         }
-      } else {
-        infRes = runDummy(x);
-      }
-#else
-      InferenceResult infRes = runDummy(x);
-#endif
-
-      res.code = 200;
-      res.set_header("Content-Type", "application/json");
-      res.body = infRes.body.dump();
-      add_cors_headers(res);
-      return res;
-    } catch (const std::exception& e) {
-      res.code = 400;
-      res.body = std::string("{\"error\":\"") + e.what() + "\"}";
-      add_cors_headers(res);
-      return res;
+    });
+    
+    // Start server
+    std::cout << "[info] CORS allowed origin: " << (cors_origin.empty() ? "none" : cors_origin) << std::endl;
+    std::cout << "[info] Starting server on port " << port << std::endl;
+    
+    if (!svr.listen("0.0.0.0", port)) {
+        std::cerr << "[error] Failed to start server on port " << port << std::endl;
+        return 1;
     }
-  });
-
-  uint16_t port = static_cast<uint16_t>(std::stoi(port_env));
-  std::cerr << "[info] Starting server on port " << port << std::endl;
-  app.port(port).multithreaded().run();
-  return 0;
+    
+    return 0;
 }
-
-

@@ -1,43 +1,37 @@
-cmake_minimum_required(VERSION 3.15)
-project(ia_cpp LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.16)
+project(ia-cpp)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Paths for ONNX Runtime (set by Dockerfile build environment)
-set(ONNXRUNTIME_ROOT "/opt/onnxruntime" CACHE PATH "ONNX Runtime root path")
-set(ONNXRUNTIME_INCLUDE_DIR "${ONNXRUNTIME_ROOT}/include" CACHE PATH "ONNX Runtime include directory")
-set(ONNXRUNTIME_LIB_DIR "${ONNXRUNTIME_ROOT}/lib" CACHE PATH "ONNX Runtime lib directory")
+# Create executable first
+add_executable(${PROJECT_NAME} src/main.cpp)
 
-include_directories(
-  ${CMAKE_SOURCE_DIR}/third_party
-  ${ONNXRUNTIME_INCLUDE_DIR}
-)
+# Include directories
+target_include_directories(${PROJECT_NAME} PRIVATE include)
 
-link_directories(${ONNXRUNTIME_LIB_DIR})
-
-add_executable(app
-  src/main.cpp
-)
-
-# Link ONNX Runtime if available at build time; still allow build without it (dummy mode)
-find_library(ONNXRUNTIME_LIB onnxruntime HINTS ${ONNXRUNTIME_LIB_DIR})
-if(ONNXRUNTIME_LIB)
-  target_link_libraries(app PRIVATE ${ONNXRUNTIME_LIB})
-  target_compile_definitions(app PRIVATE WITH_ORT=1)
-  message(STATUS "Linking with ONNX Runtime: ${ONNXRUNTIME_LIB}")
+# Check for ONNX Runtime
+if(EXISTS "/opt/onnxruntime")
+    message(STATUS "ONNX Runtime found at /opt/onnxruntime")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE WITH_ORT)
+    
+    # Include directories for ONNX Runtime
+    target_include_directories(${PROJECT_NAME} PRIVATE /opt/onnxruntime/include)
+    
+    # Link ONNX Runtime
+    target_link_libraries(${PROJECT_NAME} /opt/onnxruntime/lib/libonnxruntime.so)
+    
+    # Set library path
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        INSTALL_RPATH "/opt/onnxruntime/lib"
+        BUILD_WITH_INSTALL_RPATH TRUE
+    )
 else()
-  message(WARNING "ONNX Runtime not found; building with dummy inference only")
+    message(STATUS "ONNX Runtime not found, compiling without ORT support")
 endif()
 
+# Link pthread on UNIX systems
 if(UNIX)
-  target_link_libraries(app PRIVATE pthread)
-  # Ensure runtime can find libonnxruntime.so
-  set_target_properties(app PROPERTIES
-    INSTALL_RPATH "${ONNXRUNTIME_LIB_DIR}"
-    BUILD_WITH_INSTALL_RPATH TRUE
-  )
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} Threads::Threads)
 endif()
-
-

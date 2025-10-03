@@ -42,11 +42,11 @@ WORKDIR /app
 
 # Copy ONNX Runtime and built app
 COPY --from=build /opt/onnxruntime /opt/onnxruntime
-COPY --from=build /app/build/app /app/build/app
+COPY --from=build /app/build/ia-cpp /app/build/ia-cpp
 COPY --from=build /app/models /app/models
 
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib
 
 EXPOSE 10000
 
-CMD ["/app/build/app"]
+CMD ["/app/build/ia-cpp"]
